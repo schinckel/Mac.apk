@@ -219,6 +219,125 @@ final class MacApkWebViewBridge {
         return ref != null ? ref.get() : null;
     }
 
+    // Called on the native asset queue. App interception and stream reads belong
+    // on a Java IO thread, never AppKit's main thread or the Android UI thread.
+    // null means normal network loading; exceptions mean an intercepted load
+    // failed and MUST NOT be retried against the network.
+    static void beginInterceptRequest(long requestId, int viewId, String url, String method,
+                                       boolean mainFrame, String[] headerKv) {
+        InterceptWork work = new InterceptWork(viewId, url, method, mainFrame, headerKv);
+        REQUESTS.put(requestId, work);
+        REQUEST_IO.execute(work.future);
+    }
+
+    static Object[] awaitInterceptRequest(long requestId) throws Exception {
+        InterceptWork work = REQUESTS.get(requestId);
+        if (work == null) throw new IllegalStateException("Unknown WebView request");
+        try { return work.future.get(); }
+        finally { REQUESTS.remove(requestId, work); }
+    }
+
+    static void cancelInterceptRequest(long requestId) {
+        InterceptWork work = REQUESTS.get(requestId);
+        if (work != null) work.cancel();
+    }
+
+    private static final java.util.concurrent.ConcurrentMap<Long, InterceptWork> REQUESTS =
+        new java.util.concurrent.ConcurrentHashMap<>();
+    private static final java.util.concurrent.ExecutorService REQUEST_IO =
+        java.util.concurrent.Executors.newFixedThreadPool(4, r -> requestThread(r, "WebViewIO"));
+    private static final java.util.concurrent.ExecutorService REQUEST_CLOSE =
+        java.util.concurrent.Executors.newCachedThreadPool(r -> requestThread(r, "WebViewClose"));
+
+    private static Thread requestThread(Runnable task, String name) {
+        Thread thread = new Thread(null, task, name, 16L << 20);
+        thread.setDaemon(true);
+        return thread;
+    }
+
+    private static void closeCancelledStream(java.io.InputStream stream) {
+        if (stream == null) return;
+        REQUEST_CLOSE.execute(() -> {
+            try { stream.close(); }
+            catch (java.io.IOException ignored) { /* The cancelled response cannot be delivered. */ }
+        });
+    }
+
+    private static final class InterceptWork {
+        final java.util.concurrent.FutureTask<Object[]> future;
+        private java.io.InputStream stream;
+
+        InterceptWork(int viewId, String url, String method, boolean mainFrame, String[] headerKv) {
+            future = new java.util.concurrent.FutureTask<>(
+                () -> interceptRequest(viewId, url, method, mainFrame, headerKv, this));
+        }
+
+        synchronized boolean attach(java.io.InputStream input) {
+            if (future.isCancelled()) return false;
+            stream = input;
+            return true;
+        }
+
+        synchronized java.io.InputStream detach() {
+            java.io.InputStream input = stream;
+            stream = null;
+            return input;
+        }
+
+        void cancel() {
+            future.cancel(true);
+            closeCancelledStream(detach());
+        }
+
+        byte[] read(java.io.InputStream input) throws java.io.IOException {
+            if (!attach(input)) {
+                closeCancelledStream(input);
+                throw new java.util.concurrent.CancellationException();
+            }
+            try { return input == null ? new byte[0] : input.readAllBytes(); }
+            finally {
+                java.io.InputStream owned = detach();
+                if (owned != null) owned.close();
+            }
+        }
+    }
+
+    private static Object[] interceptRequest(int viewId, String url, String method,
+                                             boolean mainFrame, String[] headerKv, InterceptWork work) throws java.io.IOException {
+        WebView view = viewFor(viewId);
+        WebViewClient client = view == null ? null : view.getWebViewClient();
+        if (client == null) return null;
+        Map<String, String> headers = new HashMap<>();
+        for (int i = 0; headerKv != null && i + 1 < headerKv.length; i += 2) {
+            headers.put(headerKv[i], headerKv[i + 1]);
+        }
+        Map<String, String> requestHeaders = java.util.Collections.unmodifiableMap(headers);
+        WebResourceRequest request = new WebResourceRequest() {
+            @Override public android.net.Uri getUrl() { return android.net.Uri.parse(url); }
+            @Override public String getMethod() { return method; }
+            @Override public boolean isForMainFrame() { return mainFrame; }
+            @Override public boolean hasGesture() { return false; }
+            @Override public boolean isRedirect() { return false; }
+            @Override public Map<String, String> getRequestHeaders() { return requestHeaders; }
+        };
+        WebResourceResponse response = client.shouldInterceptRequest(view, request);
+        if (response == null) return null;
+        java.util.List<String> metadata = new java.util.ArrayList<>();
+        metadata.add(Integer.toString(response.getStatusCode()));
+        metadata.add(response.getMimeType());
+        metadata.add(response.getEncoding());
+        metadata.add(response.getReasonPhrase());
+        Map<String, String> responseHeaders = response.getResponseHeaders();
+        if (responseHeaders != null) {
+            for (Map.Entry<String, String> header : responseHeaders.entrySet()) {
+                metadata.add(header.getKey());
+                metadata.add(header.getValue());
+            }
+        }
+        byte[] body = work.read(response.getData());
+        return new Object[] {metadata.toArray(new String[0]), body};
+    }
+
     // ---- upcalls from native ------------------------------------------------
 
     /** Called by native on its serial event queue. Posts to the WebView's

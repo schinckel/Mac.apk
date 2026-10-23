@@ -53,7 +53,7 @@ public class WebView extends android.widget.AbsoluteLayout
 
     // ----- stored configuration (read by a future native bridge) -----
     private final WebSettings settings = new WebSettings() {};
-    private WebViewClient webViewClient;
+    private volatile WebViewClient webViewClient;
     private WebChromeClient webChromeClient;
     private DownloadListener downloadListener;
     private FindListener findListener;

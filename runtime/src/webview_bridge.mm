@@ -87,6 +87,7 @@
 #import <MetalKit/MetalKit.h>
 #import <QuartzCore/QuartzCore.h>   // CACurrentMediaTime
 #import <WebKit/WebKit.h>
+#import <CFNetwork/CFNetwork.h>
 #import <objc/runtime.h>            // objc_getAssociatedObject: the host-kind tag (WvHostKind)
 #include <jni.h>
 
@@ -97,6 +98,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <dlfcn.h>
 #include <string>
 #include <utility>
 #include <vector>
@@ -121,11 +123,16 @@ jmethodID g_mid_read_asset = nullptr;  // macapkReadAsset(ILjava/lang/String;)[B
 jmethodID g_mid_asset_mime = nullptr;  // macapkAssetMime(Ljava/lang/String;[B)Ljava/lang/String;
 jmethodID g_mid_asset_page = nullptr;
 jmethodID g_mid_real_input = nullptr;  // onRealInput()V  // macapkMaterializeAssetPage(ILjava/lang/String;)[Ljava/lang/String;
+jmethodID g_mid_intercept_begin = nullptr;
+jmethodID g_mid_intercept_await = nullptr;
+jmethodID g_mid_intercept_cancel = nullptr;
 
 // Concurrent queue for app-asset reads (the macapk-asset scheme handler). The
 // JNI read never runs on the macOS main thread: a large asset would stall
 // every window, and AOSP reads these on its own IO thread too.
 dispatch_queue_t g_asset_queue = nullptr;
+// Cancellation must not wait behind GCD workers awaiting Java response bodies.
+dispatch_queue_t g_cancel_queue = nullptr;
 
 // Serial queue for @JavascriptInterface invocation -- the Android
 // "JavaBridge" thread analog. Serial so app interface objects see the same
@@ -1323,7 +1330,7 @@ static NSString* const kWvConsoleHookJS =
        "if(!c)post(3,['Assertion failed:'].concat(Array.prototype.slice.call(arguments,1)));return oa.apply(console,arguments);};"
      "window.addEventListener('error',function(e){post(3,['Uncaught '+(e.message||e)],e.filename||'',e.lineno||0,e.error);});"
      "window.addEventListener('unhandledrejection',function(e){var r=e.reason;"
-       "post(3,['Uncaught (in promise) '+fmt(r&&r.stack?r.stack:r)],'',0,r instanceof Error?r:null);});"
+       "post(3,['Uncaught (in promise) '+fmt(r)],'',0,r instanceof Error?r:null);});"
      "})();";
 
 // ---- XMLHttpRequest DONE exactly once (2026-10-17) -------------------------
@@ -2508,6 +2515,391 @@ static NSError* WvAssetError(NSInteger code, NSString* desc, NSURL* url) {
 
 @end
 
+// ---- Android HTTP request interception ------------------------------------
+// Opt-in while the full networking contract is being validated. Keep the real
+// HTTP(S) origin: a scheme substitution changes storage, CORS and secure-context
+// semantics. WebKit has no public API for this; its registration guard calls
+// +handlesURLScheme:. Only that synchronous call on this thread is overridden,
+// never ordinary WebKit scheme classification or another thread's registration.
+static thread_local bool g_register_http_handler = false;
+static BOOL (*g_handles_scheme)(id, SEL, NSString*) = nullptr;
+
+static BOOL WvHandlesScheme(id cls, SEL selector, NSString* scheme) {
+    if (g_register_http_handler && ([scheme.lowercaseString isEqualToString:@"https"]
+                                    || [scheme.lowercaseString isEqualToString:@"http"])) return NO;
+    return g_handles_scheme(cls, selector, scheme);
+}
+
+static bool WvInterceptEnabled() {
+    const char* value = std::getenv("MACAPK_WEBVIEW_INTERCEPT");
+    return value && std::strcmp(value, "1") == 0;
+}
+
+@interface MacApkWvInterceptWork : NSObject {
+@public
+    std::atomic<bool> cancelled;
+    jlong requestId;
+    NSURLSessionDataTask* network;
+    NSURLRequest* networkRequest;
+}
+@end
+@implementation MacApkWvInterceptWork
+- (instancetype)init {
+    if ((self = [super init])) {
+        static std::atomic<jlong> next{1};
+        cancelled.store(false);
+        requestId = next.fetch_add(1);
+    }
+    return self;
+}
+@end
+
+static void WvCancelIntercept(jlong requestId) {
+    AttachedEnv attached;
+    if (!attached.env) return;
+    attached.env->CallStaticVoidMethod(g_bridge_cls, g_mid_intercept_cancel, requestId);
+    if (attached.env->ExceptionCheck()) attached.env->ExceptionClear();
+}
+
+struct WvInterceptResult {
+    NSHTTPURLResponse* response = nil;
+    NSData* body = nil;
+    bool failed = false;
+};
+
+@interface NSURLResponse (MacApkHTTPResponse)
+- (instancetype)_initWithCFURLResponse:(CFTypeRef)response;
+@end
+
+@interface MacApkWvHTTPResponse : NSHTTPURLResponse
+@property (nonatomic, copy) NSString* androidEncoding;
+@end
+@implementation MacApkWvHTTPResponse
+- (NSString*)textEncodingName {
+    // Android's explicit encoding is independent of its response headers.
+    // WebKit consumes this accessor when building its ResourceResponse.
+    return self.androidEncoding.length ? self.androidEncoding : [super textEncodingName];
+}
+@end
+
+@interface NSURLRequest (MacApkCookieContext)
+- (id)_propertyForKey:(NSString*)key;
+@end
+@interface NSURLSessionTask (MacApkCookieContext)
+@property (nonatomic, copy) NSURL* _siteForCookies;
+@property (nonatomic) BOOL _isTopLevelNavigation;
+@end
+
+static NSURL* WvCookieSite(NSURLRequest* request) {
+    id site = [request _propertyForKey:@"_kCFHTTPCookiePolicyPropertySiteForCookies"];
+    return [site isKindOfClass:[NSURL class]] ? site : [NSURL URLWithString:@""];
+}
+
+static bool WvTopLevelNavigation(NSURLRequest* request) {
+    return [[request _propertyForKey:@"_kCFHTTPCookiePolicyPropertyIsTopLevelNavigation"] boolValue];
+}
+
+static NSURLRequest* WvNetworkRequest(NSURLRequest* request) {
+    if (WvCookieSite(request).host.length || WvTopLevelNavigation(request)) return request;
+    // Foundation drops the distinction between absent SameSite and None when
+    // parsing cookies. Until the full browser cookie policy can be preserved,
+    // cross-site subresources must not send or accept session cookies.
+    NSMutableURLRequest* stateless = [request mutableCopy];
+    stateless.HTTPShouldHandleCookies = NO;
+    [stateless setValue:nil forHTTPHeaderField:@"Cookie"];
+    return stateless;
+}
+
+static bool WvApplyCookieContext(NSURLSessionTask* task, NSURLRequest* request) {
+    if (![task respondsToSelector:@selector(set_siteForCookies:)]
+        || ![task respondsToSelector:@selector(set_isTopLevelNavigation:)]) return false;
+    // WebKit carries this context on the request but CFNetwork enforces it on
+    // the task. Empty site means cross-site (also the safe unspecified default).
+    task._siteForCookies = WvCookieSite(request);
+    task._isTopLevelNavigation = WvTopLevelNavigation(request);
+    return true;
+}
+
+static NSHTTPURLResponse* WvHTTPResponse(NSURL* url, NSInteger status, NSString* reason,
+                                        NSDictionary<NSString*, NSString*>* headers, NSString* encoding) {
+    // NSHTTPURLResponse's public initializer discards the reason phrase. Build
+    // the CF HTTP message WebKit reads, preserving Android's custom statusText.
+    using CreateResponse = CFTypeRef (*)(CFAllocatorRef, CFURLRef, CFHTTPMessageRef, int);
+    static auto create = (CreateResponse)dlsym(RTLD_DEFAULT, "CFURLResponseCreateWithHTTPResponse");
+    if (!create || ![MacApkWvHTTPResponse instancesRespondToSelector:@selector(_initWithCFURLResponse:)]) return nil;
+    CFHTTPMessageRef message = CFHTTPMessageCreateResponse(kCFAllocatorDefault, status,
+        (__bridge CFStringRef)reason, kCFHTTPVersion1_1);
+    for (NSString* name in headers) CFHTTPMessageSetHeaderFieldValue(message,
+        (__bridge CFStringRef)name, (__bridge CFStringRef)headers[name]);
+    CFTypeRef response = create(kCFAllocatorDefault, (__bridge CFURLRef)url, message, 2 /* no cache */);
+    CFRelease(message);
+    if (!response) return nil;
+    MacApkWvHTTPResponse* result = [[MacApkWvHTTPResponse alloc] _initWithCFURLResponse:response];
+    result.androidEncoding = encoding;
+    CFRelease(response);
+    return result;
+}
+
+static WvInterceptResult WvDecodeInterceptResponse(JNIEnv* env, NSURL* url, jobjectArray result) {
+    WvInterceptResult response;
+    jobjectArray meta = (jobjectArray)env->GetObjectArrayElement(result, 0);
+    jbyteArray body = (jbyteArray)env->GetObjectArrayElement(result, 1);
+    NSString* status = FromJString(env, (jstring)env->GetObjectArrayElement(meta, 0));
+    NSString* mime = FromJString(env, (jstring)env->GetObjectArrayElement(meta, 1));
+    NSString* encoding = FromJString(env, (jstring)env->GetObjectArrayElement(meta, 2));
+    NSString* reason = FromJString(env, (jstring)env->GetObjectArrayElement(meta, 3));
+    NSMutableDictionary* headers = [NSMutableDictionary dictionary];
+    bool hasContentType = false;
+    for (jsize i = 4; i + 1 < env->GetArrayLength(meta); i += 2) {
+        jstring key = (jstring)env->GetObjectArrayElement(meta, i);
+        jstring value = (jstring)env->GetObjectArrayElement(meta, i + 1);
+        NSString* name = FromJString(env, key) ?: @"";
+        headers[name] = FromJString(env, value) ?: @"";
+        if ([name caseInsensitiveCompare:@"Content-Type"] == NSOrderedSame) hasContentType = true;
+        env->DeleteLocalRef(key);
+        env->DeleteLocalRef(value);
+    }
+    if (!hasContentType && mime.length) headers[@"Content-Type"] = encoding.length
+        ? [NSString stringWithFormat:@"%@; charset=%@", mime, encoding] : mime;
+    jsize length = env->GetArrayLength(body);
+    NSMutableData* data = [NSMutableData dataWithLength:(NSUInteger)length];
+    env->GetByteArrayRegion(body, 0, length, (jbyte*)data.mutableBytes);
+    // AOSP's three-argument WebResourceResponse leaves status unset (0/null).
+    // Default only the transport; its public Java getters retain AOSP values.
+    response.response = WvHTTPResponse(url, status.intValue == 0 ? 200 : status.intValue,
+        reason.length ? reason : @"OK", headers, encoding);
+    response.failed = response.response == nil;
+    response.body = data;
+    return response;
+}
+
+static WvInterceptResult WvIntercept(int viewId, NSURLRequest* request, bool mainFrame,
+                                    MacApkWvInterceptWork* work) {
+    WvInterceptResult response;
+    if (work->cancelled.load()) return response;
+    AttachedEnv attached;
+    JNIEnv* env = attached.env;
+    if (!env || !g_mid_intercept_begin) { response.failed = true; return response; }
+    env->PushLocalFrame(32);
+    NSDictionary* headers = request.allHTTPHeaderFields;
+    jclass stringClass = env->FindClass("java/lang/String");
+    jobjectArray kv = env->NewObjectArray((jsize)headers.count * 2, stringClass, nullptr);
+    jsize index = 0;
+    for (NSString* name in headers) {
+        jstring key = ToJString(env, name);
+        jstring value = ToJString(env, headers[name]);
+        env->SetObjectArrayElement(kv, index++, key);
+        env->SetObjectArrayElement(kv, index++, value);
+        env->DeleteLocalRef(key);
+        env->DeleteLocalRef(value);
+    }
+    env->CallStaticVoidMethod(g_bridge_cls, g_mid_intercept_begin, work->requestId,
+        (jint)viewId, ToJString(env, request.URL.absoluteString),
+        ToJString(env, request.HTTPMethod ?: @"GET"), (jboolean)mainFrame, kv);
+    jobjectArray result = nullptr;
+    if (!env->ExceptionCheck()) {
+        // An early stop may cancel before Java knows this ID. Repeat after
+        // registration; cancelling an unknown or completed ID is harmless.
+        if (work->cancelled.load()) WvCancelIntercept(work->requestId);
+        result = (jobjectArray)env->CallStaticObjectMethod(g_bridge_cls, g_mid_intercept_await, work->requestId);
+    }
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        response.failed = true;
+    }
+    if (result && !response.failed) response = WvDecodeInterceptResponse(env, request.URL, result);
+    env->PopLocalFrame(nullptr);
+    return response;
+}
+
+@protocol MacApkWvRedirectTask <WKURLSchemeTask>
+- (void)_willPerformRedirection:(NSURLResponse*)response newRequest:(NSURLRequest*)request
+             completionHandler:(void (^)(NSURLRequest*))completion;
+@end
+
+@class MacApkWvInterceptHandler;
+@interface MacApkWvNetworkDelegate : NSObject <NSURLSessionTaskDelegate>
+@property (nonatomic, weak) MacApkWvInterceptHandler* target;
+@end
+
+@interface MacApkWvInterceptHandler : NSObject <WKURLSchemeHandler>
+- (void)redirectNetworkTask:(NSURLSessionTask*)network response:(NSHTTPURLResponse*)response
+                   request:(NSURLRequest*)request completion:(void (^)(NSURLRequest*))completion;
+@end
+
+@implementation MacApkWvInterceptHandler {
+    NSMapTable<id<WKURLSchemeTask>, MacApkWvInterceptWork*>* _live;
+    NSURLSession* _session;
+    NSHTTPCookieStorage* _cookies;
+    WKHTTPCookieStore* _cookieStore;
+}
+
+- (instancetype)init {
+    if ((self = [super init])) {
+        _live = [NSMapTable strongToStrongObjectsMapTable];
+        NSURLSessionConfiguration* config = [NSURLSessionConfiguration ephemeralSessionConfiguration];
+        _cookies = config.HTTPCookieStorage;
+        config.URLCache = nil;
+        MacApkWvNetworkDelegate* delegate = [MacApkWvNetworkDelegate new];
+        delegate.target = self;
+        _session = [NSURLSession sessionWithConfiguration:config delegate:delegate
+                                            delegateQueue:NSOperationQueue.mainQueue];
+    }
+    return self;
+}
+
+- (void)complete:(id<WKURLSchemeTask>)task response:(NSURLResponse*)response
+            data:(NSData*)data error:(NSError*)error {
+    if (![_live objectForKey:task]) return;
+    [_live removeObjectForKey:task];
+    if (error) { [task didFailWithError:error]; return; }
+    [task didReceiveResponse:response];
+    if (data.length) [task didReceiveData:data];
+    [task didFinish];
+}
+
+- (void)saveCookies:(NSURLResponse*)response request:(NSURLRequest*)request completion:(void (^)(void))completion {
+    dispatch_group_t saved = dispatch_group_create();
+    if (request.HTTPShouldHandleCookies && [response isKindOfClass:[NSHTTPURLResponse class]]) {
+        NSArray* updated = [NSHTTPCookie cookiesWithResponseHeaderFields:
+            ((NSHTTPURLResponse*)response).allHeaderFields forURL:response.URL];
+        for (NSHTTPCookie* cookie in updated) {
+            dispatch_group_enter(saved);
+            [_cookieStore setCookie:cookie completionHandler:^{ dispatch_group_leave(saved); }];
+        }
+    }
+    dispatch_group_notify(saved, dispatch_get_main_queue(), completion);
+}
+
+- (void)redirectNetworkTask:(NSURLSessionTask*)network response:(NSHTTPURLResponse*)response
+                   request:(NSURLRequest*)request completion:(void (^)(NSURLRequest*))completion {
+    id<WKURLSchemeTask> schemeTask = nil;
+    for (id<WKURLSchemeTask> task in _live.keyEnumerator) {
+        if ([_live objectForKey:task]->network == network) { schemeTask = task; break; }
+    }
+    if (!schemeTask) { completion(nil); return; }
+    id<MacApkWvRedirectTask> redirect = (id<MacApkWvRedirectTask>)schemeTask;
+    if (![redirect respondsToSelector:@selector(_willPerformRedirection:newRequest:completionHandler:)]) {
+        completion(nil);
+        [self complete:schemeTask response:nil data:nil error:WvAssetError(NSURLErrorUnsupportedURL,
+            @"WebKit HTTP redirect callback unavailable", request.URL)];
+        return;
+    }
+    [self saveCookies:response request:network.currentRequest completion:^{
+        if (![self->_live objectForKey:schemeTask]) { completion(nil); return; }
+        // WebKit must observe and approve the redirect, so navigation, fetch's
+        // redirected/url fields and cross-origin checks use the final URL.
+        [redirect _willPerformRedirection:response newRequest:request completionHandler:^(NSURLRequest* approved) {
+            MacApkWvInterceptWork* work = [self->_live objectForKey:schemeTask];
+            if (!work) { completion(nil); return; }
+            if (approved) approved = WvNetworkRequest(approved);
+            if (approved && !WvApplyCookieContext(network, approved)) { completion(nil); return; }
+            work->networkRequest = approved;
+            completion(approved);
+        }];
+    }];
+}
+
+- (void)loadNetwork:(id<WKURLSchemeTask>)task webView:(WKWebView*)wv {
+    // Null interception retains ordinary TLS validation. Cookies belong to this
+    // WebView's store, not NSURLSession's process-wide cookie jar.
+    [wv.configuration.websiteDataStore.httpCookieStore getAllCookies:^(NSArray<NSHTTPCookie*>* cookies) {
+        if (![self->_live objectForKey:task]) return;
+        NSURLRequest* request = WvNetworkRequest(task.request);
+        // Preserve credentials policy and transfer SameSite context to the task.
+        // Foundation applies domain, path and Secure; never synthesize Cookie.
+        // WK is authoritative, including removals (logout / CookieManager).
+        // Merely adding its cookies would retain deleted authentication cookies
+        // in this session and send them on later fallback requests.
+        for (NSHTTPCookie* cookie in self->_cookies.cookies) [self->_cookies deleteCookie:cookie];
+        for (NSHTTPCookie* cookie in cookies) [self->_cookies setCookie:cookie];
+        NSURLSessionDataTask* network = [self->_session dataTaskWithRequest:request
+            completionHandler:^(NSData* data, NSURLResponse* response, NSError* error) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    MacApkWvInterceptWork* work = [self->_live objectForKey:task];
+                    if (!work) return;
+                    if (error) std::fprintf(stderr, "[W] webview: network fallback failed code=%ld domain=%s\n",
+                        (long)error.code, error.domain.UTF8String);
+                    [self saveCookies:response request:work->networkRequest completion:^{
+                        [self complete:task response:response data:data error:error];
+                    }];
+                });
+            }];
+        [self->_live objectForKey:task]->network = network;
+        [self->_live objectForKey:task]->networkRequest = request;
+        if (!WvApplyCookieContext(network, request)) {
+            [network cancel];
+            [self complete:task response:nil data:nil error:WvAssetError(NSURLErrorUnsupportedURL,
+                @"WebKit cookie context unavailable", request.URL)];
+            return;
+        }
+        [network resume];
+    }];
+}
+
+- (void)webView:(WKWebView*)wv startURLSchemeTask:(id<WKURLSchemeTask>)task {
+    _cookieStore = wv.configuration.websiteDataStore.httpCookieStore;
+    NSURLRequest* request = task.request;
+    MacApkWvHolder* holder = (MacApkWvHolder*)wv.navigationDelegate;
+    int viewId = holder.viewId;
+    bool mainFrame = [request.mainDocumentURL isEqual:request.URL];
+    MacApkWvInterceptWork* work = [MacApkWvInterceptWork new];
+    [_live setObject:work forKey:task];
+    dispatch_async(g_asset_queue, ^{
+        WvInterceptResult result = WvIntercept(viewId, request, mainFrame, work);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (![self->_live objectForKey:task]) return;
+            if (result.failed) {
+                [self complete:task response:nil data:nil error:WvAssetError(NSURLErrorCannotDecodeContentData,
+                    @"Android request interception failed", request.URL)];
+                return;
+            }
+            if (!result.response) { [self loadNetwork:task webView:wv]; return; }
+            [self complete:task response:result.response data:result.body error:nil];
+        });
+    });
+}
+
+- (void)webView:(WKWebView*)wv stopURLSchemeTask:(id<WKURLSchemeTask>)task {
+    MacApkWvInterceptWork* work = [_live objectForKey:task];
+    if (!work) return;
+    if (work->network) [work->network cancel];
+    else {
+        work->cancelled.store(true);
+        dispatch_async(g_cancel_queue, ^{ WvCancelIntercept(work->requestId); });
+    }
+    [_live removeObjectForKey:task];
+}
+
+- (void)dealloc { [_session invalidateAndCancel]; }
+@end
+
+@implementation MacApkWvNetworkDelegate
+- (void)URLSession:(NSURLSession*)session task:(NSURLSessionTask*)task
+    willPerformHTTPRedirection:(NSHTTPURLResponse*)response newRequest:(NSURLRequest*)request
+    completionHandler:(void (^)(NSURLRequest*))completion {
+    MacApkWvInterceptHandler* target = self.target;
+    if (target) [target redirectNetworkTask:task response:response request:request completion:completion];
+    else completion(nil);
+}
+@end
+
+static void WvInstallInterception(WKWebViewConfiguration* configuration) {
+    if (!WvInterceptEnabled() || !g_mid_intercept_begin || !g_mid_intercept_await || !g_mid_intercept_cancel) return;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        Method method = class_getClassMethod([WKWebView class], @selector(handlesURLScheme:));
+        g_handles_scheme = (BOOL (*)(id, SEL, NSString*))method_getImplementation(method);
+        method_setImplementation(method, (IMP)WvHandlesScheme);
+    });
+    g_register_http_handler = true;
+    @try {
+        MacApkWvInterceptHandler* handler = [MacApkWvInterceptHandler new];
+        [configuration setURLSchemeHandler:handler forURLScheme:@"https"];
+        [configuration setURLSchemeHandler:handler forURLScheme:@"http"];
+    } @finally { g_register_http_handler = false; }
+}
+
 // ---- JNI entry points ------------------------------------------------------
 
 namespace {
@@ -2550,6 +2942,7 @@ void JNICALL NativeCreate(JNIEnv* env, jclass, jint viewId, jstring jPkg,
         if (g_holders[@(viewId)]) return;
         WKWebViewConfiguration* cfg = [WKWebViewConfiguration new];
         cfg.websiteDataStore = EnsureDataStore(pkg);
+        WvInstallInterception(cfg);
         // WebSettings.setAllowUniversalAccessFromFileURLs(true): a file: document
         // gets universal access, so its cross-origin requests skip CORS as in
         // Chromium's WebView. WebKit SPI, readable only from the configuration a
@@ -3323,6 +3716,13 @@ void RegisterWebViewBridgeMethods(JNIEnv* env) {
     g_mid_asset_page = env->GetStaticMethodID(
         g_bridge_cls, "macapkMaterializeAssetPage", "(ILjava/lang/String;)[Ljava/lang/String;");
     if (env->ExceptionCheck()) env->ExceptionClear();
+    g_mid_intercept_begin = env->GetStaticMethodID(g_bridge_cls, "beginInterceptRequest",
+        "(JILjava/lang/String;Ljava/lang/String;Z[Ljava/lang/String;)V");
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    g_mid_intercept_await = env->GetStaticMethodID(g_bridge_cls, "awaitInterceptRequest", "(J)[Ljava/lang/Object;");
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    g_mid_intercept_cancel = env->GetStaticMethodID(g_bridge_cls, "cancelInterceptRequest", "(J)V");
+    if (env->ExceptionCheck()) env->ExceptionClear();
     if (!g_mid_read_asset || !g_mid_asset_mime) {
         // Every file:///android_asset load would then fail as not-found; make
         // the jar/runtime mismatch loud instead.
@@ -3333,6 +3733,7 @@ void RegisterWebViewBridgeMethods(JNIEnv* env) {
     g_jsbridge_queue = dispatch_queue_create("org.macapk.jsbridge", DISPATCH_QUEUE_SERIAL);
     g_event_queue = dispatch_queue_create("org.macapk.webview-events", DISPATCH_QUEUE_SERIAL);
     g_asset_queue = dispatch_queue_create("org.macapk.webview-assets", DISPATCH_QUEUE_CONCURRENT);
+    g_cancel_queue = dispatch_queue_create("org.macapk.webview-cancel", DISPATCH_QUEUE_SERIAL);
     // Host-view geometry changes (window resize / rotate) must re-place every
     // attached WKWebView; the per-frame Java pushes only fire when the ANDROID
     // rect changes. Under MACAPK_WEBVIEW_HOST_FOLLOW only the pages already ON

@@ -85,6 +85,47 @@ runtime/build/bin/macapk-runtime --apk /path/to/app.apk --orientation landscape
 
 Logs go to stderr. For an installed app, its log is in `~/Library/Logs/macapk/`.
 
+### Experimental HTTP WebView interception
+
+`MACAPK_WEBVIEW_INTERCEPT=1` enables Android `WebViewClient.shouldInterceptRequest`
+for HTTP(S) documents and subresources. This lets Capacitor serve its bundled UI
+and inject its native bridge without changing the APK or its `https://localhost`
+origin. The gate defaults to off. Run a candidate with a separate data root:
+
+```bash
+MACAPK_WEBVIEW_INTERCEPT=1 runtime/build/bin/macapk-runtime \
+  --apk /path/to/app.apk --android-root /tmp/macapk-capacitor-test
+```
+
+This uses WebKit internals: a thread-local override of the scheme-registration
+guard, response construction and WebKit's redirect callback. Requests declined by
+the app use a private ephemeral NSURLSession with normal TLS validation, WebKit's
+SameSite/top-level task context, and the WebView's cookie store. No certificate exceptions or origin substitutions
+are installed. Keep this opt-in until broader app compatibility is validated.
+
+After building the Java runtime, run `bash debug/webview_intercept_smoke.sh`.
+It compiles the production native bridge into a standalone WKWebView/JNI harness
+and checks HTTPS assets, response metadata, native calls, registration-guard
+cleanup and thread isolation, AOSP response defaults, custom reason phrases,
+failed interception without network retry, POST bodies, cookie deletion,
+omitted credentials, cross-site Strict/Lax cookie sending and persistence,
+cancelled blocked streams, redirects, CORS rejection and rejection of a disposable
+self-signed certificate. Fixture servers bind loopback and use synthetic data.
+
+This is a compatibility candidate, not a complete Android network stack:
+response bodies are buffered, service-worker interception is not implemented,
+request gesture/redirect flags are currently false, and main-frame classification
+is inferred from `mainDocumentURL`. Authentication, background work and native
+plugins still require app-specific testing and configuration.
+WebKit tracking-prevention and partitioned-cookie policies are not reproduced by
+the fallback session. Cross-site subresource fallback requests therefore send and
+accept no cookies, including `SameSite=None`; cookie-authenticated cross-site APIs
+are not supported by this candidate. Same-site cookies and explicit authorization
+headers remain supported. This remains opt-in rather than a general browser network stack.
+Cancelled reads are interrupted and their streams closed away from AppKit;
+arbitrary app code that ignores both interruption and closure cannot be forcibly
+terminated by this bridge.
+
 After building the framework, run the standalone AGSL pixel-contract smoke:
 
 ```bash

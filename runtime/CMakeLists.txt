@@ -413,7 +413,6 @@ target_link_libraries(macapk-runtime PRIVATE
     # dyld shared cache, so nothing is bundled.
     "-framework IOSurface"
     "-framework WebKit"
-    "-framework CFNetwork"
     "-framework GameController"
     "-framework CoreLocation"
     "-framework MediaPlayer"
